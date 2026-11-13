@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+"""Tiny Synology Chat client for the Omarchy bar widget.
+
+Talks to the same DSM Web API the Chat web app uses and prints JSON.
+
+  synochat setup                   ask for server, user and password (kept in the keyring)
+  synochat channels                joined channels with unread counts
+  synochat posts <channel> [n]     last n posts of a channel (default 30)
+  synochat send <channel> <text>   post a message
+  synochat read <channel>          mark a channel as read
+  synochat open-file <post> <name> download a post's file to ~/Downloads and open it
+  synochat notify <channel> <title> [n]  desktop notification with the last n messages
+
+Configuration comes from the environment (the widget passes its settings) and
+falls back to ~/.config/omarchy-synochat/config.json, written by `setup`:
+  SYNOCHAT_SERVER   https://host:port of DSM
+  SYNOCHAT_USER     DSM account         (default $USER)
+  SYNOCHAT_VERIFY   1 to verify TLS     (default 0, DSM certs are often self-signed)
+  SYNOCHAT_DEMO     1 to serve made-up data (for screenshots), no server needed
+"""
+
+import getpass
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONFIG_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "omarchy-synochat", "config.json")
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+USERS_TTL = 600
+DEMO = os.environ.get("SYNOCHAT_DEMO", "0") == "1"
+
+
+def load_config():
+    try:
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def configure(server, user):
+    """Set the module-level connection globals for one server/user pair."""
+    global SERVER, USER, KEYRING, CACHE_KEY, SID_FILE, USERS_FILE
+    SERVER = (server or "").strip().rstrip("/")
+    if SERVER and "://" not in SERVER:
+        SERVER = "https://" + SERVER
+    USER = (user or "").strip()
+    KEYRING = ["service", "omarchy-synochat", "user", USER, "server", SERVER]
+    CACHE_KEY = urllib.parse.quote(f"{USER}@{SERVER}", safe="")
+    SID_FILE = os.path.join(RUNTIME, f"omarchy-synochat-{CACHE_KEY}.sid")
+    USERS_FILE = os.path.join(RUNTIME, f"omarchy-synochat-{CACHE_KEY}.users.json")
+
+
+_config = load_config()
+configure(os.environ.get("SYNOCHAT_SERVER") or _config.get("server", ""),
+          os.environ.get("SYNOCHAT_USER") or _config.get("user") or os.environ.get("USER", ""))
+VERIFY = os.environ.get("SYNOCHAT_VERIFY", "0") == "1"
+
+# DSM codes meaning the session is gone and a fresh login will fix it.
+SESSION_ERRORS = {105, 106, 107, 119}
+
+
+class ChatError(Exception):
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+def fail(message, code=1):
+    print(json.dumps({"error": message}))
+    sys.exit(code)
+
+
+def ssl_context():
+    if VERIFY:
+        return ssl.create_default_context()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def http_post(params):
+    body = urllib.parse.urlencode(params).encode()
+    req = urllib.request.Request(SERVER + "/webapi/entry.cgi", data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req, context=ssl_context(), timeout=15) as res:
+            data = json.loads(res.read().decode("utf-8", "replace"))
+    except urllib.error.URLError as e:
+        raise ChatError(f"Cannot reach {SERVER}: {getattr(e, 'reason', e)}")
+    except (ValueError, OSError) as e:
+        raise ChatError(f"Bad response from {SERVER}: {e}")
+    if not data.get("success"):
+        code = (data.get("error") or {}).get("code")
+        raise ChatError(f"DSM error {code}", code)
+    return data.get("data") or {}
+
+
+# ------------------------------------------------------------------ session
+
+def keyring_password():
+    try:
+        out = subprocess.run(["secret-tool", "lookup", *KEYRING], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return out.stdout.rstrip("\n") if out.returncode == 0 else ""
+
+
+def login():
+    if not SERVER:
+        raise ChatError("no-credentials", "no-credentials")
+    password = keyring_password()
+    if not password:
+        raise ChatError("no-credentials", "no-credentials")
+    try:
+        data = http_post({
+            "api": "SYNO.API.Auth", "version": "6", "method": "login",
+            "account": USER, "passwd": password, "session": "Chat", "format": "sid",
+        })
+    except ChatError as e:
+        if e.code in (400, 401, 402, 403, 404):
+            raise ChatError("Login failed: wrong user/password or 2FA required", "auth")
+        raise
+    sid = data.get("sid", "")
+    if not sid:
+        raise ChatError("Login returned no session id")
+    # The Chat app registers its own session on top of the DSM one.
+    http_post({"api": "SYNO.Chat.User", "version": "2", "method": "login", "_sid": sid})
+    fd = os.open(SID_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(sid)
+    return sid
+
+
+def cached_sid():
+    try:
+        with open(SID_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def call(api, method, version, **params):
+    """Call a JSON-format Chat API, logging in again if the session expired."""
+    encoded = {k: json.dumps(v) for k, v in params.items() if v is not None}
+    base = {"api": api, "method": method, "version": str(version), **encoded}
+    sid = cached_sid() or login()
+    try:
+        return http_post({**base, "_sid": sid})
+    except ChatError as e:
+        if e.code not in SESSION_ERRORS:
+            raise
+    return http_post({**base, "_sid": login()})
+
+
+# ------------------------------------------------------------------ users
+
+AVATAR_VERSIONS = {}
+
+
+def users():
+    """user_id -> display name; also fills AVATAR_VERSIONS."""
+    cached = None
+    try:
+        if time.time() - os.path.getmtime(USERS_FILE) < USERS_TTL:
+            with open(USERS_FILE) as f:
+                cached = {int(k): v for k, v in json.load(f).items()}
+    except (OSError, ValueError):
+        pass
+    if cached is None or any(not isinstance(v, list) for v in cached.values()):
+        data = call("SYNO.Chat.User", "list", 2)
+        cached = {}
+        for u in data.get("users", []):
+            name = u.get("nickname") or u.get("username") or str(u.get("user_id"))
+            cached[int(u.get("user_id", 0))] = [name, int(u.get("avatar_version") or 0)]
+        with open(USERS_FILE, "w") as f:
+            json.dump(cached, f)
+    AVATAR_VERSIONS.update({uid: v[1] for uid, v in cached.items()})
+    return {uid: v[0] for uid, v in cached.items()}
+
+
+def avatar(user_id):
+    """Local path of a user's avatar, re-downloaded when they change it."""
+    version = AVATAR_VERSIONS.get(user_id, 0)
+    if not version:
+        return ""
+    dest = os.path.join(CACHE_DIR, "avatars", f"{user_id}-{version}.png")
+    if os.path.exists(dest):
+        return dest
+    if download("SYNO.Chat.User.Avatar", "get", 1, dest, user_id=user_id, type="M", v=version):
+        return dest
+    return ""
+
+
+def me_id():
+    path = os.path.join(RUNTIME, f"omarchy-synochat-{CACHE_KEY}.me")
+    try:
+        with open(path) as f:
+            return int(f.read())
+    except (OSError, ValueError):
+        pass
+    data = call("SYNO.Chat.User", "login", 2)
+    uid = int((data.get("user") or {}).get("user_id", 0))
+    with open(path, "w") as f:
+        f.write(str(uid))
+    return uid
+
+
+# ------------------------------------------------------------------ commands
+
+# The two channels every Chat server starts with have no stored name.
+DEFAULT_CHANNELS = {1: "general", 2: "random"}
+
+
+def channel_members(cid):
+    """Members of a direct-message channel; they never change, so cache them."""
+    path = os.path.join(RUNTIME, f"omarchy-synochat-{CACHE_KEY}.members.json")
+    try:
+        with open(path) as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    if str(cid) not in cache:
+        ch = call("SYNO.Chat.Channel", "get", 4, channel_id=int(cid)).get("channel") or {}
+        cache[str(cid)] = ch.get("members") or []
+        with open(path, "w") as f:
+            json.dump(cache, f)
+    return cache[str(cid)]
+
+
+def channel_name(ch, names, me):
+    name = ch.get("name") or ""
+    if name:
+        return name
+    cid = int(ch.get("channel_id") or 0)
+    if ch.get("type") == "anonymous":
+        members = [m for m in channel_members(cid) if m != me]
+        if members:
+            return ", ".join(names.get(int(m), str(m)) for m in members)
+    return DEFAULT_CHANNELS.get(cid, "channel " + str(cid))
+
+
+def cmd_channels():
+    data = call("SYNO.Chat.Channel", "list", 5, is_joined=True)
+    names = users()
+    me = me_id()
+    out = []
+    for ch in data.get("channels", []):
+        ctype = ch.get("type") or ""
+        out.append({
+            "id": ch.get("channel_id"),
+            "name": channel_name(ch, names, me),
+            "type": ctype,
+            "direct": ctype in ("anonymous", "synobot", "chatbot"),
+            "unread": int(ch.get("unread") or 0),
+            "mentions": int(ch.get("unread_mention") or 0),
+            "lastPostAt": int(ch.get("last_post_at") or 0),
+            "starred": bool(ch.get("is_star")),
+        })
+    print(json.dumps({"channels": out}))
+
+
+# ------------------------------------------------------------------ emoji
+
+EMOJI_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "emoji.json")
+SHORTCODE = re.compile(r":([a-z0-9_+\-]+):")
+# The few ASCII smileys Chat turns into emoji, only as standalone words.
+EMOTICONS = {":-)": "🙂", ":)": "🙂", ":-(": "🙁", ":(": "🙁", ";-)": "😉", ";)": "😉",
+             ":-D": "😃", ":D": "😃", ":-P": "😛", ":P": "😛", ":-O": "😮", ":'(": "😢", "<3": "❤️"}
+EMOTICON = re.compile(r"(?<!\S)(" + "|".join(re.escape(e) for e in EMOTICONS) + r")(?!\S)")
+_emoji = None
+
+
+def emojify(text):
+    global _emoji
+    if _emoji is None:
+        try:
+            with open(EMOJI_FILE, encoding="utf-8") as f:
+                _emoji = json.load(f)
+        except (OSError, ValueError):
+            _emoji = {}
+    text = SHORTCODE.sub(lambda m: _emoji.get(m.group(1), m.group(0)), text)
+    return EMOTICON.sub(lambda m: EMOTICONS[m.group(1)], text)
+
+
+# ------------------------------------------------------------------ files
+
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "omarchy-synochat")
+THUMB_MAX_BYTES = 15 * 1024 * 1024
+
+
+def download(api, method, version, dest, **params):
+    """Fetch a binary Chat API response into dest; returns True on success."""
+    encoded = {k: json.dumps(v) for k, v in params.items()}
+    for attempt in range(2):
+        sid = cached_sid() if attempt == 0 else login()
+        if not sid:
+            sid = login()
+        query = urllib.parse.urlencode({"api": api, "method": method, "version": str(version), **encoded, "_sid": sid})
+        try:
+            with urllib.request.urlopen(SERVER + "/webapi/entry.cgi?" + query, context=ssl_context(), timeout=60) as res:
+                ctype = res.headers.get("Content-Type", "")
+                body = res.read()
+        except (urllib.error.URLError, OSError):
+            return False
+        if ctype.startswith("application/json"):
+            try:
+                code = (json.loads(body).get("error") or {}).get("code")
+            except ValueError:
+                code = None
+            if code in SESSION_ERRORS and attempt == 0:
+                continue
+            return False
+        if ctype.startswith("text/html"):
+            return False
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        tmp = dest + ".part"
+        with open(tmp, "wb") as f:
+            f.write(body)
+        os.replace(tmp, dest)
+        return True
+    return False
+
+
+def thumbnail(post_id, props):
+    """Local path of an image post's preview, downloaded once."""
+    dest = os.path.join(CACHE_DIR, "thumbs", f"{post_id}.img")
+    if os.path.exists(dest):
+        return dest
+    if download("SYNO.Chat.Post.File", "thumbnail", 2, dest, post_id=post_id, type="M"):
+        return dest
+    if int(props.get("size") or 0) <= THUMB_MAX_BYTES and download("SYNO.Chat.Post.File", "get", 2, dest, post_id=post_id):
+        return dest
+    return ""
+
+
+def cmd_open_file(post_id, name):
+    """Download a post's file to ~/Downloads and open it."""
+    downloads = subprocess.run(["xdg-user-dir", "DOWNLOAD"], capture_output=True, text=True).stdout.strip() or os.path.expanduser("~/Downloads")
+    name = os.path.basename(name) or f"{post_id}"
+    stem, ext = os.path.splitext(name)
+    dest = os.path.join(downloads, name)
+    n = 1
+    while os.path.exists(dest):
+        dest = os.path.join(downloads, f"{stem} ({n}){ext}")
+        n += 1
+    if not download("SYNO.Chat.Post.File", "get", 2, dest, post_id=int(post_id)):
+        fail("Download failed")
+    subprocess.Popen(["xdg-open", dest], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    print(json.dumps({"ok": True, "path": dest}))
+
+
+# ------------------------------------------------------------------ posts
+
+def post_entry(p, names, me):
+    creator = int(p.get("creator_id") or 0)
+    entry = {
+        "id": p.get("post_id"),
+        "author": names.get(creator, str(creator)),
+        "authorId": creator,
+        "avatar": "" if creator == me else avatar(creator),
+        "mine": creator == me,
+        "text": emojify(p.get("message") or ""),
+        "at": int(p.get("create_at") or 0),
+        "comments": int(p.get("comment_count") or 0),
+        "links": [],
+        "file": None,
+    }
+    for u in p.get("url_props") or []:
+        if u.get("url") and not u.get("hidden"):
+            entry["links"].append({"url": u["url"], "title": u.get("title") or "", "description": u.get("description") or ""})
+    fp = p.get("file_props") or {}
+    if fp:
+        entry["file"] = {
+            "name": fp.get("name") or "file",
+            "size": int(fp.get("size") or 0),
+            "image": bool(fp.get("is_image")),
+            "snippet": bool(fp.get("is_snippet")),
+            "preview": (fp.get("snippet_preview") or "")[:400] if fp.get("is_snippet") else "",
+            "thumb": "",
+        }
+    return entry
+
+
+def post_text(p):
+    text = emojify(p.get("message") or "")
+    if not text and p.get("file_props"):
+        fp = p.get("file_props") or {}
+        text = ("🖼 " if fp.get("is_image") else "📎 ") + (fp.get("name") or "file")
+    return text
+
+
+def cmd_posts(channel, count=30):
+    data = call("SYNO.Chat.Post", "list", 5, channel_id=int(channel))
+    names = users()
+    me = me_id()
+    posts = sorted(data.get("posts", []), key=lambda p: int(p.get("create_at") or 0))
+    # Without an anchor post the API returns the channel's recent history.
+    out = [post_entry(p, names, me) for p in posts[-int(count):]]
+    for entry, p in zip(out, posts[-int(count):]):
+        if entry["file"] and entry["file"]["image"]:
+            entry["file"]["thumb"] = thumbnail(entry["id"], p.get("file_props") or {})
+    print(json.dumps({"posts": out}))
+
+
+def cmd_send(channel, text):
+    text = text.strip()
+    if not text:
+        fail("Empty message")
+    data = call("SYNO.Chat.Post", "create", 5, channel_id=int(channel), type="normal", message=text)
+    print(json.dumps({"ok": True, "id": data.get("post_id")}))
+
+
+def cmd_read(channel):
+    call("SYNO.Chat.Channel", "view", 2, channel_id=int(channel), last_view_at=int(time.time() * 1000))
+    print(json.dumps({"ok": True}))
+
+
+def cmd_notify(channel, title, count=1):
+    """Desktop notification with the newest messages of a channel."""
+    data = call("SYNO.Chat.Post", "list", 5, channel_id=int(channel))
+    names = users()
+    me = me_id()
+    posts = sorted(data.get("posts", []), key=lambda p: int(p.get("create_at") or 0))
+    posts = [p for p in posts if int(p.get("creator_id") or 0) != me][-max(1, min(int(count), 5)):]
+    if not posts:
+        return
+    # Every monitor runs its own widget; only the first to see a post notifies.
+    import fcntl
+    state_path = os.path.join(RUNTIME, f"omarchy-synochat-{CACHE_KEY}.notified.json")
+    with open(state_path, "a+") as state:
+        fcntl.flock(state, fcntl.LOCK_EX)
+        state.seek(0)
+        try:
+            seen = json.loads(state.read() or "{}")
+        except ValueError:
+            seen = {}
+        last = int(seen.get(str(channel), 0))
+        posts = [p for p in posts if int(p.get("post_id") or 0) > last]
+        if not posts:
+            return
+        seen[str(channel)] = int(posts[-1].get("post_id") or 0)
+        state.seek(0)
+        state.truncate()
+        state.write(json.dumps(seen))
+    lines = []
+    for p in posts:
+        author = names.get(int(p.get("creator_id") or 0), "")
+        text = post_text(p) or "…"
+        lines.append(text if author == title else f"{author}: {text}")
+    subprocess.run(["notify-send", "-a", "Synology Chat", "-i", "synology-chat", title, "\n".join(lines)], timeout=10)
+    print(json.dumps({"ok": True}))
+
+
+def ask(prompt, default=""):
+    suffix = f" [{default}]" if default else ""
+    answer = input(f"{prompt}{suffix}: ").strip()
+    return answer or default
+
+
+def cmd_setup():
+    """Interactive first-run: server, user and password; meant for a terminal."""
+    if not sys.stdin.isatty():
+        fail("Run `synochat setup` in a terminal")
+    print("Synology Chat for Omarchy: connect to your NAS.\n")
+    server = ask("DSM address (e.g. https://nas.local:5001)", SERVER)
+    user = ask("DSM user", USER)
+    if not server or not user:
+        fail("Server and user are required")
+    configure(server, user)
+    password = getpass.getpass(f"Password for {USER} on {SERVER}: ")
+    if not password:
+        fail("Empty password")
+    res = subprocess.run(["secret-tool", "store", "--label", f"Synology Chat ({USER}@{SERVER})", *KEYRING], input=password, text=True)
+    if res.returncode != 0:
+        fail("Could not store the password with secret-tool (is a keyring running?)")
+    try:
+        os.unlink(SID_FILE)
+    except OSError:
+        pass
+    try:
+        login()
+    except ChatError as e:
+        fail(f"Saved, but signing in failed: {e}")
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump({"server": SERVER, "user": USER}, f, indent=2)
+    print(f"\nSigned in as {USER} on {SERVER}. You can close this window.")
+
+
+# ------------------------------------------------------------------ demo
+
+def demo(cmd, args):
+    """Made-up conversations for screenshots; no network involved."""
+    now = int(time.time() * 1000)
+    minute = 60000
+    channels = [
+        {"id": 10, "name": "Maya Lindqvist", "type": "anonymous", "direct": True, "unread": 2, "mentions": 0, "lastPostAt": now - 2 * minute, "starred": False},
+        {"id": 11, "name": "design-team", "type": "public", "direct": False, "unread": 5, "mentions": 1, "lastPostAt": now - 9 * minute, "starred": False},
+        {"id": 12, "name": "Tomás Ferreira", "type": "anonymous", "direct": True, "unread": 0, "mentions": 0, "lastPostAt": now - 80 * minute, "starred": False},
+        {"id": 13, "name": "general", "type": "public", "direct": False, "unread": 0, "mentions": 0, "lastPostAt": now - 26 * 60 * minute, "starred": False},
+        {"id": 14, "name": "synobot", "type": "synobot", "direct": True, "unread": 0, "mentions": 0, "lastPostAt": now - 3 * 24 * 60 * minute, "starred": False},
+    ]
+    def post(i, author, uid, mine, text, ago, links=None, file=None):
+        return {"id": i, "author": author, "authorId": uid, "avatar": "", "mine": mine, "text": emojify(text),
+                "at": now - ago * minute, "comments": 0, "links": links or [], "file": file}
+    posts = [
+        post(1, "Maya Lindqvist", 3, False, "Morning! Did the new build pass on the staging NAS?", 42),
+        post(2, "You", 1, True, "Yes :white_check_mark: all green, deploying after lunch", 40),
+        post(3, "Maya Lindqvist", 3, False, "Great :tada:", 39),
+        post(4, "Maya Lindqvist", 3, False, "Here are the release notes https://example.com/releases/2.4", 12,
+             links=[{"url": "https://example.com/releases/2.4", "title": "Release 2.4 · Notes", "description": "Faster sync, new bar widget and bug fixes."}]),
+        post(5, "Maya Lindqvist", 3, False, "", 3, file={"name": "rollout-plan.pdf", "size": 284113, "image": False, "snippet": False, "preview": "", "thumb": ""}),
+        post(6, "Maya Lindqvist", 3, False, "Can you check section 3 before 4pm? :pray:", 2),
+    ]
+    if cmd == "channels":
+        print(json.dumps({"channels": channels}))
+    elif cmd == "posts":
+        print(json.dumps({"posts": posts}))
+    else:
+        print(json.dumps({"ok": True}))
+
+
+def main(argv):
+    if not argv:
+        fail(__doc__.strip())
+    cmd, args = argv[0], argv[1:]
+    if DEMO and cmd in ("channels", "posts", "send", "read", "notify", "open-file"):
+        return demo(cmd, args)
+    try:
+        if cmd == "channels":
+            cmd_channels()
+        elif cmd == "posts" and args:
+            cmd_posts(args[0], args[1] if len(args) > 1 else 30)
+        elif cmd == "send" and len(args) >= 2:
+            cmd_send(args[0], " ".join(args[1:]))
+        elif cmd == "read" and args:
+            cmd_read(args[0])
+        elif cmd == "open-file" and len(args) >= 2:
+            cmd_open_file(args[0], args[1])
+        elif cmd == "notify" and len(args) >= 2:
+            cmd_notify(args[0], args[1], args[2] if len(args) > 2 else 1)
+        elif cmd in ("setup", "set-password"):
+            cmd_setup()
+        elif cmd == "raw" and len(args) >= 3:
+            # Debug helper: synochat raw <api> <method> <version> [json-params]
+            params = json.loads(args[3]) if len(args) > 3 else {}
+            print(json.dumps(call(args[0], args[1], int(args[2]), **params), indent=1))
+        else:
+            fail(__doc__.strip())
+    except ChatError as e:
+        fail(str(e), 2 if e.code == "no-credentials" else 1)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

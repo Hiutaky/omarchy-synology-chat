@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "hiutaky.synology-chat",
+  "name": "Synology Chat",
+  "version": "1.0.0",
+  "author": "Hiutaky",
+  "license": "MIT",
+  "description": "Synology Chat in the Omarchy bar: unread badge, read and reply to channels and direct messages, links, images, emoji and desktop notifications.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Widget.qml" },
+  "barWidget": {
+    "displayName": "Synology Chat",
+    "description": "Unread badge for Synology Chat with a panel to read channels and direct messages and reply.",
+    "category": "Communication",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "server": "",
+      "username": "",
+      "verifyTls": "Off",
+      "notifications": "On",
+      "refreshIntervalSec": 20
+    },
+    "schema": [
+      { "key": "server", "type": "string", "label": "Server", "defaultValue": "", "description": "Optional. DSM address with port, e.g. https://nas.local:5001. Leave empty to use the one entered during setup." },
+      { "key": "username", "type": "string", "label": "DSM user", "defaultValue": "", "description": "Optional. Leave empty to use the one entered during setup. The password always lives in the keyring." },
+      { "key": "verifyTls", "type": "enum", "label": "Verify TLS certificate", "options": ["Off", "On"], "defaultValue": "Off", "description": "Turn on if your NAS has a certificate from a trusted CA." },
+      { "key": "notifications", "type": "enum", "label": "Desktop notifications", "options": ["On", "Off"], "defaultValue": "On" },
+      { "key": "refreshIntervalSec", "type": "integer", "label": "Refresh interval (seconds)", "min": 5, "max": 3600, "step": 5, "defaultValue": 20 }
+    ]
+  }
+}
