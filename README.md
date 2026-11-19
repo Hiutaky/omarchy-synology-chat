@@ -115,7 +115,7 @@ conversations without any server:
 ## Privacy and security
 
 Your password stays in the keyring. It is sent only to the DSM server you
-configure, over HTTPS.
+configure, over HTTPS: only `https://` addresses are accepted.
 
 With **Verify TLS certificate** off, setup shows the SHA-256 fingerprint of
 the certificate your NAS presents and asks you to trust it; from then on the

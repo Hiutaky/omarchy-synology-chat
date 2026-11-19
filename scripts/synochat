@@ -52,6 +52,9 @@ def configure(server, user):
     SERVER = (server or "").strip().rstrip("/")
     if SERVER and "://" not in SERVER:
         SERVER = "https://" + SERVER
+    if SERVER:
+        scheme, rest = SERVER.split("://", 1)
+        SERVER = scheme.lower() + "://" + rest
     USER = (user or "").strip()
     KEYRING = ["service", "omarchy-synochat", "user", USER, "server", SERVER]
     CACHE_KEY = urllib.parse.quote(f"{USER}@{SERVER}", safe="")
@@ -94,7 +97,7 @@ def pinned_fingerprint():
 
 
 def server_fingerprint():
-    u = urllib.parse.urlsplit(SERVER)
+    u = check_server()
     try:
         pem = ssl.get_server_certificate((u.hostname, u.port or 443), timeout=15)
     except (OSError, ValueError) as e:
@@ -121,17 +124,26 @@ def check_pin(der):
         raise ChatError("The server certificate changed: run setup again to review and trust it", "untrusted")
 
 
+def check_server():
+    """Only https is supported: anything else would send the password in clear."""
+    try:
+        u = urllib.parse.urlsplit(SERVER)
+        u.port
+    except ValueError:
+        u = None
+    if not u or u.scheme != "https" or not u.hostname:
+        raise ChatError(f"Unsupported server address {SERVER!r}: use https://host:port", "no-credentials")
+    return u
+
+
 def fetch(query="", body=None, timeout=15):
     """One request to DSM's entry.cgi; returns (content type, body bytes)."""
-    u = urllib.parse.urlsplit(SERVER)
+    u = check_server()
     path = u.path + "/webapi/entry.cgi" + ("?" + query if query else "")
-    if u.scheme == "https":
-        conn = http.client.HTTPSConnection(u.hostname, u.port, timeout=timeout, context=ssl_context())
-    else:
-        conn = http.client.HTTPConnection(u.hostname, u.port, timeout=timeout)
+    conn = http.client.HTTPSConnection(u.hostname, u.port, timeout=timeout, context=ssl_context())
     try:
         conn.connect()
-        if u.scheme == "https" and not VERIFY:
+        if not VERIFY:
             check_pin(conn.sock.getpeercert(binary_form=True))
         if body is None:
             conn.request("GET", path)
@@ -170,6 +182,7 @@ def keyring_password():
 def login(password=None):
     if not SERVER:
         raise ChatError("no-credentials", "no-credentials")
+    check_server()
     password = password or keyring_password()
     if not password:
         raise ChatError("no-credentials", "no-credentials")
@@ -350,6 +363,18 @@ CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser(
 THUMB_MAX_BYTES = 15 * 1024 * 1024
 
 
+def secure_cache():
+    """Once, tighten files cached by versions that wrote them world-readable."""
+    marker = os.path.join(CACHE_DIR, ".private")
+    if not os.path.isdir(CACHE_DIR) or os.path.exists(marker):
+        return
+    for root, _, files in os.walk(CACHE_DIR):
+        os.chmod(root, 0o700)
+        for name in files:
+            os.chmod(os.path.join(root, name), 0o600)
+    os.close(os.open(marker, os.O_WRONLY | os.O_CREAT, 0o600))
+
+
 def private_dir(path):
     """Create path under CACHE_DIR, with the cache root readable only by us."""
     os.makedirs(path, mode=0o700, exist_ok=True)
@@ -464,6 +489,7 @@ def post_text(p):
 def cmd_posts(channel, count=30):
     # Without an anchor post, prev_count asks for the channel's newest posts;
     # recent Chat releases return none when it is missing.
+    secure_cache()
     data = call("SYNO.Chat.Post", "list", 5, channel_id=int(channel), prev_count=int(count))
     names = users()
     me = me_id()
@@ -559,9 +585,13 @@ def cmd_setup():
     if not server or not user:
         fail("Server and user are required")
     configure(server, user)
+    try:
+        check_server()
+    except ChatError as e:
+        fail(str(e))
     config = load_config()
     pins = config.get("fingerprints") or {}
-    if SERVER.startswith("https://") and not VERIFY:
+    if not VERIFY:
         try:
             fp = server_fingerprint()
         except ChatError as e:
@@ -579,8 +609,6 @@ def cmd_setup():
         os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
         with open(CONFIG_FILE, "w") as f:
             json.dump(config, f, indent=2)
-    elif SERVER.startswith("http://"):
-        print("\nWARNING: plain http sends your password unencrypted.")
     saved = keyring_password()
     hint = " (Enter to keep the saved one)" if saved else ""
     password = getpass.getpass(f"Password for {USER} on {SERVER}{hint}: ") or saved

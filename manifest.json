@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "hiutaky.synology-chat",
   "name": "Synology Chat",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": "Hiutaky",
   "license": "MIT",
   "description": "Synology Chat in the Omarchy bar: unread badge, read and reply to channels and direct messages, links, images, emoji and desktop notifications.",
