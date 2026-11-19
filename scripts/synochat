@@ -6,7 +6,7 @@ Talks to the same DSM Web API the Chat web app uses and prints JSON.
   synochat setup                   ask for server, user and password (kept in the keyring)
   synochat channels                joined channels with unread counts
   synochat posts <channel> [n]     last n posts of a channel (default 30)
-  synochat send <channel> <text>   post a message
+  synochat send <channel> [text]   post a message (read from stdin without text)
   synochat read <channel>          mark a channel as read
   synochat open-file <post> <name> download a post's file to ~/Downloads and open it
   synochat notify <channel> <title> [n]  desktop notification with the last n messages
@@ -15,11 +15,14 @@ Configuration comes from the environment (the widget passes its settings) and
 falls back to ~/.config/omarchy-synochat/config.json, written by `setup`:
   SYNOCHAT_SERVER   https://host:port of DSM
   SYNOCHAT_USER     DSM account         (default $USER)
-  SYNOCHAT_VERIFY   1 to verify TLS     (default 0, DSM certs are often self-signed)
+  SYNOCHAT_VERIFY   1 to verify TLS against the system CAs; by default the
+                    certificate must match the one trusted during `setup`
   SYNOCHAT_DEMO     1 to serve made-up data (for screenshots), no server needed
 """
 
 import getpass
+import hashlib
+import http.client
 import json
 import os
 import re
@@ -27,9 +30,7 @@ import ssl
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 
 CONFIG_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "omarchy-synochat", "config.json")
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
@@ -78,25 +79,77 @@ def fail(message, code=1):
     sys.exit(code)
 
 
+# ------------------------------------------------------------------ tls
+
+def fingerprint(der):
+    return hashlib.sha256(der).hexdigest()
+
+
+def pretty_fingerprint(fp):
+    return ":".join(fp[i:i + 2] for i in range(0, len(fp), 2)).upper()
+
+
+def pinned_fingerprint():
+    return (load_config().get("fingerprints") or {}).get(SERVER, "")
+
+
+def server_fingerprint():
+    u = urllib.parse.urlsplit(SERVER)
+    try:
+        pem = ssl.get_server_certificate((u.hostname, u.port or 443), timeout=15)
+    except (OSError, ValueError) as e:
+        raise ChatError(f"Cannot reach {SERVER}: {e}")
+    return fingerprint(ssl.PEM_cert_to_DER_cert(pem))
+
+
 def ssl_context():
     if VERIFY:
         return ssl.create_default_context()
+    # Self-signed DSM certificates: the chain is not checked, the certificate
+    # itself is compared with the one pinned during setup before any data goes out.
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
 
-def http_post(params):
-    body = urllib.parse.urlencode(params).encode()
-    req = urllib.request.Request(SERVER + "/webapi/entry.cgi", data=body, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+def check_pin(der):
+    pinned = pinned_fingerprint()
+    if not pinned:
+        raise ChatError("untrusted-certificate", "untrusted")
+    if fingerprint(der) != pinned:
+        raise ChatError("The server certificate changed: run setup again to review and trust it", "untrusted")
+
+
+def fetch(query="", body=None, timeout=15):
+    """One request to DSM's entry.cgi; returns (content type, body bytes)."""
+    u = urllib.parse.urlsplit(SERVER)
+    path = u.path + "/webapi/entry.cgi" + ("?" + query if query else "")
+    if u.scheme == "https":
+        conn = http.client.HTTPSConnection(u.hostname, u.port, timeout=timeout, context=ssl_context())
+    else:
+        conn = http.client.HTTPConnection(u.hostname, u.port, timeout=timeout)
     try:
-        with urllib.request.urlopen(req, context=ssl_context(), timeout=15) as res:
-            data = json.loads(res.read().decode("utf-8", "replace"))
-    except urllib.error.URLError as e:
-        raise ChatError(f"Cannot reach {SERVER}: {getattr(e, 'reason', e)}")
-    except (ValueError, OSError) as e:
+        conn.connect()
+        if u.scheme == "https" and not VERIFY:
+            check_pin(conn.sock.getpeercert(binary_form=True))
+        if body is None:
+            conn.request("GET", path)
+        else:
+            conn.request("POST", path, body=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        res = conn.getresponse()
+        return res.getheader("Content-Type", ""), res.read()
+    except (OSError, http.client.HTTPException, ValueError) as e:
+        raise ChatError(f"Cannot reach {SERVER}: {e}")
+    finally:
+        conn.close()
+
+
+def http_post(params):
+    _, raw = fetch(body=urllib.parse.urlencode(params).encode())
+    try:
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError as e:
         raise ChatError(f"Bad response from {SERVER}: {e}")
     if not data.get("success"):
         code = (data.get("error") or {}).get("code")
@@ -114,10 +167,10 @@ def keyring_password():
     return out.stdout.rstrip("\n") if out.returncode == 0 else ""
 
 
-def login():
+def login(password=None):
     if not SERVER:
         raise ChatError("no-credentials", "no-credentials")
-    password = keyring_password()
+    password = password or keyring_password()
     if not password:
         raise ChatError("no-credentials", "no-credentials")
     try:
@@ -297,6 +350,12 @@ CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser(
 THUMB_MAX_BYTES = 15 * 1024 * 1024
 
 
+def private_dir(path):
+    """Create path under CACHE_DIR, with the cache root readable only by us."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(CACHE_DIR, 0o700)
+
+
 def download(api, method, version, dest, **params):
     """Fetch a binary Chat API response into dest; returns True on success."""
     encoded = {k: json.dumps(v) for k, v in params.items()}
@@ -306,10 +365,8 @@ def download(api, method, version, dest, **params):
             sid = login()
         query = urllib.parse.urlencode({"api": api, "method": method, "version": str(version), **encoded, "_sid": sid})
         try:
-            with urllib.request.urlopen(SERVER + "/webapi/entry.cgi?" + query, context=ssl_context(), timeout=60) as res:
-                ctype = res.headers.get("Content-Type", "")
-                body = res.read()
-        except (urllib.error.URLError, OSError):
+            ctype, body = fetch(query, timeout=60)
+        except ChatError:
             return False
         if ctype.startswith("application/json"):
             try:
@@ -321,9 +378,15 @@ def download(api, method, version, dest, **params):
             return False
         if ctype.startswith("text/html"):
             return False
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        # Cached avatars and previews are private; files the user downloads are not.
+        private = dest.startswith(CACHE_DIR + os.sep)
+        if private:
+            private_dir(os.path.dirname(dest))
+        else:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
         tmp = dest + ".part"
-        with open(tmp, "wb") as f:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o666)
+        with os.fdopen(fd, "wb") as f:
             f.write(body)
         os.replace(tmp, dest)
         return True
@@ -399,11 +462,12 @@ def post_text(p):
 
 
 def cmd_posts(channel, count=30):
-    data = call("SYNO.Chat.Post", "list", 5, channel_id=int(channel))
+    # Without an anchor post, prev_count asks for the channel's newest posts;
+    # recent Chat releases return none when it is missing.
+    data = call("SYNO.Chat.Post", "list", 5, channel_id=int(channel), prev_count=int(count))
     names = users()
     me = me_id()
     posts = sorted(data.get("posts", []), key=lambda p: int(p.get("create_at") or 0))
-    # Without an anchor post the API returns the channel's recent history.
     out = [post_entry(p, names, me) for p in posts[-int(count):]]
     for entry, p in zip(out, posts[-int(count):]):
         if entry["file"] and entry["file"]["image"]:
@@ -426,7 +490,7 @@ def cmd_read(channel):
 
 def cmd_notify(channel, title, count=1):
     """Desktop notification with the newest messages of a channel."""
-    data = call("SYNO.Chat.Post", "list", 5, channel_id=int(channel))
+    data = call("SYNO.Chat.Post", "list", 5, channel_id=int(channel), prev_count=20)
     names = users()
     me = me_id()
     posts = sorted(data.get("posts", []), key=lambda p: int(p.get("create_at") or 0))
@@ -456,8 +520,27 @@ def cmd_notify(channel, title, count=1):
         author = names.get(int(p.get("creator_id") or 0), "")
         text = post_text(p) or "…"
         lines.append(text if author == title else f"{author}: {text}")
-    subprocess.run(["notify-send", "-a", "Synology Chat", "-i", "synology-chat", title, "\n".join(lines)], timeout=10)
+    desktop_notify(title, "\n".join(lines), len(lines))
     print(json.dumps({"ok": True}))
+
+
+def desktop_notify(title, body, count):
+    """Send over D-Bus so message text never shows up in a process's arguments."""
+    try:
+        import gi
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio, GLib
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        bus.call_sync("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                      "org.freedesktop.Notifications", "Notify",
+                      GLib.Variant("(susssasa{sv}i)", ("Synology Chat", 0, "synology-chat", title, body, [], {}, -1)),
+                      None, Gio.DBusCallFlags.NONE, 10000, None)
+        return
+    except Exception:
+        pass
+    # Without PyGObject, notify-send gets only a count, never the text.
+    summary = f"{count} new message" + ("" if count == 1 else "s")
+    subprocess.run(["notify-send", "-a", "Synology Chat", "-i", "synology-chat", title, summary], timeout=10)
 
 
 def ask(prompt, default=""):
@@ -476,23 +559,50 @@ def cmd_setup():
     if not server or not user:
         fail("Server and user are required")
     configure(server, user)
-    password = getpass.getpass(f"Password for {USER} on {SERVER}: ")
+    config = load_config()
+    pins = config.get("fingerprints") or {}
+    if SERVER.startswith("https://") and not VERIFY:
+        try:
+            fp = server_fingerprint()
+        except ChatError as e:
+            fail(str(e))
+        if pins.get(SERVER) and pins[SERVER] != fp:
+            print("\nWARNING: the certificate differs from the one trusted before.")
+            print("Unless you renewed it on the NAS, someone may be intercepting the connection.")
+        if pins.get(SERVER) != fp:
+            print(f"\nSHA-256 fingerprint of the certificate at {SERVER}:\n  {pretty_fingerprint(fp)}")
+            print("Compare it with DSM > Control Panel > Security > Certificate.")
+            if ask("Trust this certificate? (y/N)").lower() not in ("y", "yes"):
+                fail("Certificate not trusted")
+        pins[SERVER] = fp
+        config["fingerprints"] = pins
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f, indent=2)
+    elif SERVER.startswith("http://"):
+        print("\nWARNING: plain http sends your password unencrypted.")
+    saved = keyring_password()
+    hint = " (Enter to keep the saved one)" if saved else ""
+    password = getpass.getpass(f"Password for {USER} on {SERVER}{hint}: ") or saved
     if not password:
         fail("Empty password")
-    res = subprocess.run(["secret-tool", "store", "--label", f"Synology Chat ({USER}@{SERVER})", *KEYRING], input=password, text=True)
-    if res.returncode != 0:
-        fail("Could not store the password with secret-tool (is a keyring running?)")
     try:
         os.unlink(SID_FILE)
     except OSError:
         pass
+    # Only a password that signs in is kept, so a typo never replaces a good one.
     try:
-        login()
+        login(password)
     except ChatError as e:
-        fail(f"Saved, but signing in failed: {e}")
+        fail(f"Signing in failed, nothing saved: {e}")
+    if password != saved:
+        res = subprocess.run(["secret-tool", "store", "--label", f"Synology Chat ({USER}@{SERVER})", *KEYRING], input=password, text=True)
+        if res.returncode != 0:
+            fail("Could not store the password with secret-tool (is a keyring running?)")
+    config.update({"server": SERVER, "user": USER})
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
-        json.dump({"server": SERVER, "user": USER}, f, indent=2)
+        json.dump(config, f, indent=2)
     print(f"\nSigned in as {USER} on {SERVER}. You can close this window.")
 
 
@@ -540,8 +650,8 @@ def main(argv):
             cmd_channels()
         elif cmd == "posts" and args:
             cmd_posts(args[0], args[1] if len(args) > 1 else 30)
-        elif cmd == "send" and len(args) >= 2:
-            cmd_send(args[0], " ".join(args[1:]))
+        elif cmd == "send" and args:
+            cmd_send(args[0], " ".join(args[1:]) if len(args) > 1 else sys.stdin.read())
         elif cmd == "read" and args:
             cmd_read(args[0])
         elif cmd == "open-file" and len(args) >= 2:
@@ -557,7 +667,7 @@ def main(argv):
         else:
             fail(__doc__.strip())
     except ChatError as e:
-        fail(str(e), 2 if e.code == "no-credentials" else 1)
+        fail(str(e), 2 if e.code in ("no-credentials", "untrusted", "auth") else 1)
 
 
 if __name__ == "__main__":

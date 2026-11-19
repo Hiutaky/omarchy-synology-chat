@@ -70,7 +70,7 @@ These are plugin settings, all optional:
 |---|---|---|
 | Server | from setup | DSM address; it overrides the one from setup |
 | DSM user | from setup | |
-| Verify TLS certificate | Off | DSM often uses a self-signed certificate. Turn this on if yours is from a trusted CA |
+| Verify TLS certificate | Off | Off pins the certificate confirmed during setup (fine for self-signed DSM certificates). Turn this on if yours is from a trusted CA |
 | Desktop notifications | On | |
 | Refresh interval | 20 s | The panel refreshes every 5 s while it is open |
 
@@ -117,8 +117,16 @@ conversations without any server:
 Your password stays in the keyring. It is sent only to the DSM server you
 configure, over HTTPS.
 
-With **Verify TLS certificate** off, the plugin accepts any certificate the
-server presents. That is fine on a trusted LAN. Over the internet, turn it on.
+With **Verify TLS certificate** off, setup shows the SHA-256 fingerprint of
+the certificate your NAS presents and asks you to trust it; from then on the
+plugin only talks to a server with that exact certificate, so self-signed DSM
+certificates work without accepting just any certificate. If the certificate
+changes (for example after a renewal) the widget asks you to run setup again.
+Turn the option on if your certificate comes from a trusted CA.
+
+Messages you send and notification previews are passed through stdin and
+D-Bus, never on a command line, and cached avatars and image previews are
+readable only by you.
 
 Like every Omarchy plugin, this one runs unsandboxed with your user
 permissions.

@@ -87,7 +87,10 @@ Item {
     if (message === "" || sendProcess.running) return false
     lastError = ""
     sendProcess.channelId = id
-    sendProcess.command = command(["send", String(id), message])
+    sendProcess.message = message
+    // The text goes through stdin so it never appears in the process arguments.
+    sendProcess.command = command(["send", String(id)])
+    sendProcess.stdinEnabled = true
     sendProcess.running = true
     return true
   }
@@ -114,7 +117,7 @@ Item {
     var result = Model.parse(raw, "channels")
     needsSetup = exitCode === 2
     if (result.error !== "") {
-      lastError = needsSetup ? "" : result.error
+      lastError = result.error === "no-credentials" || result.error === "untrusted-certificate" ? "" : result.error
       return
     }
     lastError = ""
@@ -193,7 +196,13 @@ Item {
   Process {
     id: sendProcess
     property var channelId: null
+    property string message: ""
     stdout: StdioCollector { id: sendOut; waitForEnd: true }
+    onStarted: {
+      write(message)
+      message = ""
+      stdinEnabled = false
+    }
     onExited: function(exitCode) {
       var result = Model.parse(sendOut.text, "ok")
       if (exitCode !== 0) root.lastError = result.error || "Sending failed"

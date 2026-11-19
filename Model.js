@@ -54,12 +54,21 @@ function escapeHtml(s) {
 
 var URL_RE = /(https?:\/\/[^\s<>"']+[^\s<>"'.,;:!?)\]])/g
 
+// Links longer than this are shown shortened; the full URL stays the target.
+// Hundreds of characters with no break point (tracking-laden eBay links) send
+// the text layout into a loop that eats memory until the shell dies.
+var LINK_LABEL_MAX = 60
+
+function linkLabel(url) {
+  return url.length > LINK_LABEL_MAX ? url.slice(0, LINK_LABEL_MAX - 1) + "…" : url
+}
+
 // Plain message -> rich text with clickable links, keeping line breaks.
 function richText(text, linkColor) {
   var parts = String(text || "").split(URL_RE)
   var html = ""
   for (var i = 0; i < parts.length; i++) {
-    if (i % 2 === 1) html += '<a href="' + escapeHtml(parts[i]) + '" style="color:' + linkColor + '">' + escapeHtml(parts[i]) + "</a>"
+    if (i % 2 === 1) html += '<a href="' + escapeHtml(parts[i]) + '" style="color:' + linkColor + '">' + escapeHtml(linkLabel(parts[i])) + "</a>"
     else html += escapeHtml(parts[i])
   }
   return html.replace(/\n/g, "<br>")
